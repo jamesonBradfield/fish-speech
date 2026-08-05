@@ -16,6 +16,7 @@ Usage:
       --output out.wav
 """
 import argparse
+import io
 import time
 from pathlib import Path
 
@@ -32,7 +33,7 @@ from fish_speech.models.text2semantic.inference import (
 from fish_speech.models.text2semantic.llama import DualARTransformer
 from fish_speech.utils.schema import Message, TextPart
 
-CACHE_LEN = 2048
+CACHE_LEN = 1024
 N_LAYER = 24
 N_FAST = 4
 N_CODEBOOK = 8
@@ -108,15 +109,47 @@ class OnnxTTS:
             else ["CPUExecutionProvider"]
         )
         d = Path(onnx_dir)
+        self.onnx_dir = d
+        self.use_dml = use_dml
         self.slow = ort.InferenceSession(str(d / "slow.onnx"), so, providers=providers)
         self.fast = ort.InferenceSession(str(d / "fast.onnx"), so, providers=providers)
         self.emb = ort.InferenceSession(str(d / "fast_emb.onnx"), so, providers=providers)
+        self._uh2d_sess = None
+
+        # VQGAN encoder/decoder, loaded once (loading is ~1s; decode is ~0.3s)
+        from tools.vqgan.extract_vq import get_model
+        from tools.export_onnx import Encoder, Decoder
+
+        vqgan = get_model(
+            "firefly_gan_vq",
+            f"{checkpoint}/firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
+            device="cpu",
+        )
+        self._vqgan_enc = Encoder(vqgan)
+        self._vqgan_dec = Decoder(vqgan)
 
         # cache buffers
         self.k_cache = np.zeros((N_LAYER, 1, 2, CACHE_LEN, 64), np.float32)
         self.v_cache = np.zeros((N_LAYER, 1, 2, CACHE_LEN, 64), np.float32)
         self.fk_cache = np.zeros((N_FAST, 1, 2, N_CODEBOOK, 64), np.float32)
         self.fv_cache = np.zeros((N_FAST, 1, 2, N_CODEBOOK, 64), np.float32)
+
+    def _uh2d(self):
+        if self._uh2d_sess is None:
+            import onnxruntime as ort
+
+            so = ort.SessionOptions()
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            so.enable_mem_pattern = False
+            providers = (
+                ["DmlExecutionProvider", "CPUExecutionProvider"]
+                if self.use_dml
+                else ["CPUExecutionProvider"]
+            )
+            self._uh2d_sess = ort.InferenceSession(
+                str(self.onnx_dir / "uhdyn2d.onnx"), so, providers=providers
+            )
+        return self._uh2d_sess
 
     # ---- slow / fast steps ----
     def slow_step(self, tok_row, pos, is_semantic):
@@ -201,6 +234,9 @@ class OnnxTTS:
     # ---- generate ----
     def generate(self, prompt, max_new_tokens, sampling_kwargs):
         T = prompt.shape[1]
+        if T >= CACHE_LEN:
+            raise ValueError(f"prompt length {T} exceeds CACHE_LEN {CACHE_LEN}")
+        max_new_tokens = min(max_new_tokens, CACHE_LEN - T)
         seq = np.zeros((1 + N_CODEBOOK, self.cfg.max_seq_len), np.int64)
         seq[:, :T] = prompt
 
@@ -240,24 +276,30 @@ class OnnxTTS:
         return y
 
     # ---- reference encoding (torch CPU, negligible cost) ----
-    def encode_reference(self, audio_path: str):
-        from tools.vqgan.extract_vq import get_model
-        from tools.export_onnx import Encoder
-
-        data, sr = sf.read(audio_path, dtype="float32", always_2d=True)
+    def encode_reference(self, audio):
+        if isinstance(audio, (bytes, bytearray)):
+            data, sr = sf.read(io.BytesIO(bytes(audio)), dtype="float32", always_2d=True)
+        else:
+            data, sr = sf.read(audio, dtype="float32", always_2d=True)
         wave = torch.from_numpy(data.T).mean(dim=0, keepdim=True)
         if sr != 22050:
             wave = torchaudio.functional.resample(wave, sr, 22050)
-        model = get_model(
-            "firefly_gan_vq",
-            f"{self.checkpoint}/firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
-            device="cpu",
-        )
-        enc = Encoder(model)
-        codes = enc(wave[None])  # [1, 8, L]
+        codes = self._vqgan_enc(wave[None])  # [1, 8, L]
         return codes[0].to(torch.int32)  # [8, L]
 
-    def synthesize(self, text, reference_audio, reference_text, max_new_tokens=0):
+    def synthesize(
+        self,
+        text,
+        reference_audio=None,
+        reference_text=None,
+        max_new_tokens=0,
+        top_p=0.7,
+        repetition_penalty=1.5,
+        temperature=0.7,
+        seed=None,
+    ):
+        if seed is not None:
+            np.random.seed(seed)
         tokenizer = self.tok
         encoded_prompts = [
             Conversation(
@@ -275,17 +317,18 @@ class OnnxTTS:
             .to("cpu")
             .numpy()
         ]
-        prompt_tokens = self.encode_reference(reference_audio)
-        encoded_prompts.append(
-            encode_tokens(
-                tokenizer,
-                string=reference_text,
-                device="cpu",
-                prompt_tokens=prompt_tokens,
-                num_codebooks=self.cfg.num_codebooks,
+        if reference_audio is not None:
+            prompt_tokens = self.encode_reference(reference_audio)
+            encoded_prompts.append(
+                encode_tokens(
+                    tokenizer,
+                    string=reference_text,
+                    device="cpu",
+                    prompt_tokens=prompt_tokens,
+                    num_codebooks=self.cfg.num_codebooks,
+                )
+                .numpy()
             )
-            .numpy()
-        )
         texts = split_text(text, 150)
         encoded = [
             encode_tokens(
@@ -296,9 +339,9 @@ class OnnxTTS:
         prompt = np.concatenate(encoded_prompts + encoded, axis=1)  # [9, S]
 
         sampling_kwargs = {
-            "top_p": 0.7,
-            "repetition_penalty": 1.5,
-            "temperature": 0.7,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            "temperature": temperature,
         }
         if max_new_tokens <= 0:
             max_new_tokens = self.cfg.max_seq_len - prompt.shape[1]
@@ -308,59 +351,47 @@ class OnnxTTS:
         assert (codes >= 0).all()
         return codes
 
-
-_UH2D_SESSION = None
-_UH2D_PROVIDERS = ["DmlExecutionProvider", "CPUExecutionProvider"]
-
-
-def _uh2d_session(onnx_dir):
-    global _UH2D_SESSION
-    if _UH2D_SESSION is None:
-        import onnxruntime as ort
-
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        so.enable_mem_pattern = False
-        _UH2D_SESSION = ort.InferenceSession(
-            str(Path(onnx_dir) / "uhdyn2d.onnx"), so, providers=_UH2D_PROVIDERS
-        )
-    return _UH2D_SESSION
-
-
-def decode_codes_to_audio(codes, checkpoint_dir, onnx_dir="onnx_artifacts"):
-    """Decode [8, L] codes to audio: numpy/torch FSQ lookup (fast) + the
-    conv stack (upsample+head) on DirectML via uhdyn2d.onnx, falling back
-    to the full torch decoder if the ONNX graph is unavailable."""
-    from tools.vqgan.extract_vq import get_model
-    from tools.export_onnx import Decoder
-
-    model = get_model(
-        "firefly_gan_vq",
-        f"{checkpoint_dir}/firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
-        device="cpu",
-    )
-    dec = Decoder(model)
-    idx = torch.from_numpy(codes[None].astype(np.int64))
-    with torch.inference_mode():
-        # FSQ codebook lookup (0.001s) -> [1, 512, L]
-        ind = idx.view(1, 8, -1, idx.shape[-1]).permute(1, 0, 3, 2)
-        dims = dec.model.quantizer.residual_fsq.dim
-        groups = dec.model.quantizer.residual_fsq.groups
-        dpg = dims // groups
-        z_q = torch.empty((1, idx.shape[-1], dims))
-        for i in range(groups):
-            z_q[:, :, i * dpg : (i + 1) * dpg] = dec.get_output_from_indices(
-                i, ind[i]
-            )
-        z = z_q.transpose(1, 2).contiguous().numpy().astype(np.float32)
+    def decode(self, codes):
+        """[8, L] codes -> audio: FSQ lookup (torch) + conv stack on DirectML."""
+        idx = torch.from_numpy(codes[None].astype(np.int64))
+        with torch.inference_mode():
+            ind = idx.view(1, 8, -1, idx.shape[-1]).permute(1, 0, 3, 2)
+            dims = self._vqgan_dec.model.quantizer.residual_fsq.dim
+            groups = self._vqgan_dec.model.quantizer.residual_fsq.groups
+            dpg = dims // groups
+            z_q = torch.empty((1, idx.shape[-1], dims))
+            for i in range(groups):
+                z_q[:, :, i * dpg : (i + 1) * dpg] = (
+                    self._vqgan_dec.get_output_from_indices(i, ind[i])
+                )
+            z = z_q.transpose(1, 2).contiguous().numpy().astype(np.float32)
         try:
-            out = _uh2d_session(onnx_dir).run(["audio"], {"z": z})[0]
+            out = self._uh2d().run(["audio"], {"z": z})[0]
+            return out[0, 0]
         except Exception:
-            audio = dec.model.head(
-                dec.model.quantizer.upsample(torch.from_numpy(z))
-            )
+            with torch.inference_mode():
+                audio = self._vqgan_dec.model.head(
+                    self._vqgan_dec.model.quantizer.upsample(torch.from_numpy(z))
+                )
             return audio[0, 0].numpy()
-    return out[0, 0]
+
+    def synthesize_request(self, req) -> np.ndarray:
+        """Full TTS for a ServeTTSRequest; returns 22050 Hz float32 audio."""
+        refs = list(req.references or [])
+        kw = dict(
+            max_new_tokens=req.max_new_tokens,
+            top_p=req.top_p,
+            repetition_penalty=req.repetition_penalty,
+            temperature=req.temperature,
+            seed=req.seed,
+        )
+        if refs and refs[0].audio:
+            codes = self.synthesize(
+                req.text, reference_audio=refs[0].audio, reference_text=refs[0].text, **kw
+            )
+        else:
+            codes = self.synthesize(req.text, **kw)
+        return self.decode(codes)
 
 
 def main():
@@ -383,7 +414,7 @@ def main():
     print(f"[generate] {time.perf_counter()-t0:.1f}s -> codes {codes.shape}")
 
     t0 = time.perf_counter()
-    audio = decode_codes_to_audio(codes, args.checkpoint)
+    audio = engine.decode(codes)
     print(f"[decode] {time.perf_counter()-t0:.1f}s -> {len(audio)/22050:.2f}s audio")
     sf.write(args.output, audio, 22050)
     print(f"[saved] {args.output}")

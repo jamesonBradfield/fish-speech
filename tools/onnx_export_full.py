@@ -25,7 +25,7 @@ from torch.nn import functional as F
 from fish_speech.models.text2semantic.llama import DualARTransformer, apply_rotary_emb
 from fish_speech.models.text2semantic.inference import load_model
 
-CACHE_LEN = 2048  # static KV cache length (config max_seq_len is 8192)
+CACHE_LEN = 1024  # static KV cache length; 1024 covers typical short-TTS usage
 
 
 class SlowStep(nn.Module):
