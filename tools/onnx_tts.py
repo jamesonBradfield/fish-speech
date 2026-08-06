@@ -295,6 +295,9 @@ class OnnxTTS:
         wave = torch.from_numpy(data.T).mean(dim=0, keepdim=True)
         if sr != 22050:
             wave = torchaudio.functional.resample(wave, sr, 22050)
+        rms = float(wave.pow(2).mean().sqrt())
+        if 0 < rms < 0.15:
+            wave = wave * (0.15 / rms)  # boost quiet references to a healthy level
         codes = self._vqgan_enc(wave[None])  # [1, 8, L]
         return codes[0].to(torch.int32)  # [8, L]
 
