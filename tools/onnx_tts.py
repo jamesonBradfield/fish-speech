@@ -68,10 +68,15 @@ def sample_logits(logits, previous_tokens, repetition_penalty, top_p, temperatur
 
 
 class OnnxTTS:
-    def __init__(self, checkpoint: str, onnx_dir: str, use_dml: bool = True):
+    def __init__(
+        self, checkpoint: str, onnx_dir: str, use_dml: bool = True, use_fp16: bool = False
+    ):
         from fish_speech.models.text2semantic.inference import load_model
 
         self.checkpoint = checkpoint
+        self.use_fp16 = use_fp16
+        self._hdtype = np.float16 if use_fp16 else np.float32
+        suffix = "16" if use_fp16 else ""
         self.model, _ = load_model(checkpoint, device="cpu", precision=torch.float32)
         assert isinstance(self.model, DualARTransformer)
         with torch.device("cpu"):
@@ -93,9 +98,9 @@ class OnnxTTS:
         self.freqs = self.model.freqs_cis[:CACHE_LEN].float().numpy()  # [2048,32,2]
         self.fast_freqs = self.model.fast_freqs_cis.float().numpy()  # [8,32,2]
         causal = self.model.causal_mask[:CACHE_LEN, :CACHE_LEN].numpy()  # [2048,2048]
-        self.mask_rows = np.where(causal, 0.0, -np.inf).astype(np.float32)
+        self.mask_rows = np.where(causal, 0.0, -np.inf).astype(self._hdtype)
         fast_causal = self.model.causal_mask[:N_CODEBOOK, :N_CODEBOOK].numpy()
-        self.fast_mask_rows = np.where(fast_causal, 0.0, -np.inf).astype(np.float32)
+        self.fast_mask_rows = np.where(fast_causal, 0.0, -np.inf).astype(self._hdtype)
 
         # ONNX sessions
         import onnxruntime as ort
@@ -111,8 +116,12 @@ class OnnxTTS:
         d = Path(onnx_dir)
         self.onnx_dir = d
         self.use_dml = use_dml
-        self.slow = ort.InferenceSession(str(d / "slow.onnx"), so, providers=providers)
-        self.fast = ort.InferenceSession(str(d / "fast.onnx"), so, providers=providers)
+        self.slow = ort.InferenceSession(
+            str(d / f"slow{suffix}.onnx"), so, providers=providers
+        )
+        self.fast = ort.InferenceSession(
+            str(d / f"fast{suffix}.onnx"), so, providers=providers
+        )
         self.emb = ort.InferenceSession(str(d / "fast_emb.onnx"), so, providers=providers)
         self._uh2d_sess = None
 
@@ -129,10 +138,10 @@ class OnnxTTS:
         self._vqgan_dec = Decoder(vqgan)
 
         # cache buffers
-        self.k_cache = np.zeros((N_LAYER, 1, 2, CACHE_LEN, 64), np.float32)
-        self.v_cache = np.zeros((N_LAYER, 1, 2, CACHE_LEN, 64), np.float32)
-        self.fk_cache = np.zeros((N_FAST, 1, 2, N_CODEBOOK, 64), np.float32)
-        self.fv_cache = np.zeros((N_FAST, 1, 2, N_CODEBOOK, 64), np.float32)
+        self.k_cache = np.zeros((N_LAYER, 1, 2, CACHE_LEN, 64), self._hdtype)
+        self.v_cache = np.zeros((N_LAYER, 1, 2, CACHE_LEN, 64), self._hdtype)
+        self.fk_cache = np.zeros((N_FAST, 1, 2, N_CODEBOOK, 64), self._hdtype)
+        self.fv_cache = np.zeros((N_FAST, 1, 2, N_CODEBOOK, 64), self._hdtype)
 
     def _uh2d(self):
         if self._uh2d_sess is None:
@@ -164,7 +173,7 @@ class OnnxTTS:
             feeds[f"k_in_{i}"] = self.k_cache[i]
             feeds[f"v_in_{i}"] = self.v_cache[i]
         outs = self.slow.run(None, feeds)
-        logits = np.reshape(outs[0], (102048,))  # [102048]
+        logits = np.reshape(outs[0], (102048,)).astype(np.float32)  # [102048]
         hidden = np.reshape(outs[1], (1, 1, 1024))
         for i in range(N_LAYER):
             self.k_cache[i][:, :, pos] = np.reshape(outs[2 + i], (1, 2, 64))
@@ -184,7 +193,7 @@ class OnnxTTS:
             feeds[f"k_in_{i}"] = self.fk_cache[i]
             feeds[f"v_in_{i}"] = self.fv_cache[i]
         outs = self.fast.run(None, feeds)
-        logits = np.reshape(outs[0], (1024,))  # [1024]
+        logits = np.reshape(outs[0], (1024,)).astype(np.float32)  # [1024]
         for i in range(N_FAST):
             self.fk_cache[i][:, :, pos] = np.reshape(outs[1 + i], (1, 2, 64))
             self.fv_cache[i][:, :, pos] = np.reshape(outs[1 + N_FAST + i], (1, 2, 64))
@@ -192,7 +201,7 @@ class OnnxTTS:
 
     def fast_emb(self, ids):
         out = self.emb.run(["h"], {"ids": np.array([[ids]], np.int64)})[0]
-        return np.reshape(out, (1, 1, 1024))
+        return np.reshape(out, (1, 1, 1024)).astype(self._hdtype)
 
     # ---- codebook sampling given slow-path logits + hidden ----
     def sample_codes(self, logits, hidden, previous_tokens, sampling_kwargs):
@@ -248,12 +257,14 @@ class OnnxTTS:
             pt = torch.from_numpy(prompt.astype(np.int64)).unsqueeze(0)
             r = self.model.forward_generate(pt, torch.arange(T, dtype=torch.long))
             last_logits = r.logits[0, 0].numpy()
-            last_hidden = r.hidden_states[0, 0].float().numpy()[None, None]
+            last_hidden = (
+                r.hidden_states[0, 0].float().numpy()[None, None].astype(self._hdtype)
+            )
         for i, layer in enumerate(self.model.layers):
             kc = layer.attention.kv_cache.k_cache
             vc = layer.attention.kv_cache.v_cache
-            self.k_cache[i][0, :, :T, :] = kc[0, :, :T, :].numpy()
-            self.v_cache[i][0, :, :T, :] = vc[0, :, :T, :].numpy()
+            self.k_cache[i][0, :, :T, :] = kc[0, :, :T, :].numpy().astype(self._hdtype)
+            self.v_cache[i][0, :, :T, :] = vc[0, :, :T, :].numpy().astype(self._hdtype)
 
         previous_tokens = np.zeros((1 + N_CODEBOOK, self.cfg.max_seq_len), np.int64)
         # next_token is sampled from the LAST prompt position (matches torch
@@ -403,10 +414,13 @@ def main():
     ap.add_argument("--reference_text", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--no-dml", action="store_true")
+    ap.add_argument("--fp16", action="store_true", help="use slow16/fast16 graphs")
     args = ap.parse_args()
 
     t0 = time.perf_counter()
-    engine = OnnxTTS(args.checkpoint, args.onnx_dir, use_dml=not args.no_dml)
+    engine = OnnxTTS(
+        args.checkpoint, args.onnx_dir, use_dml=not args.no_dml, use_fp16=args.fp16
+    )
     print(f"[init] {time.perf_counter()-t0:.1f}s")
 
     t0 = time.perf_counter()

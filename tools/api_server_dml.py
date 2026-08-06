@@ -96,6 +96,7 @@ class API(ExceptionHandler):
         ap.add_argument("--checkpoint", default="checkpoints/fish-speech-1.5")
         ap.add_argument("--onnx-dir", default="onnx_artifacts")
         ap.add_argument("--api-key", default=None)
+        ap.add_argument("--fp16", action="store_true", help="use slow16/fast16 graphs")
         self.args = ap.parse_args()
 
         def api_auth(endpoint):
@@ -129,7 +130,9 @@ class API(ExceptionHandler):
 
     async def initialize_app(self, app: Kui):
         t0 = time.perf_counter()
-        app.state.engine = OnnxTTS(self.args.checkpoint, self.args.onnx_dir, use_dml=True)
+        app.state.engine = OnnxTTS(
+            self.args.checkpoint, self.args.onnx_dir, use_dml=True, use_fp16=self.args.fp16
+        )
         logger.info(f"DML engine ready in {time.perf_counter() - t0:.1f}s")
         logger.info(f"Startup done, listening server at http://{self.args.listen}")
 

@@ -28,6 +28,23 @@ from fish_speech.models.text2semantic.inference import load_model
 CACHE_LEN = 1024  # static KV cache length; 1024 covers typical short-TTS usage
 
 
+def rope_fixed(x, freqs_cis):
+    """apply_rotary_emb with explicit dims: DML's Reshape kernel rejects
+    target-shape tensors containing -1 (E_INVALIDARG at graph compile)."""
+    n_pair = x.shape[-1] // 2
+    xshaped = x.float().reshape(x.shape[0], x.shape[1], x.shape[2], n_pair, 2)
+    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+    x_out2 = torch.stack(
+        [
+            xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
+            xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
+        ],
+        -1,
+    )
+    x_out2 = x_out2.flatten(3)
+    return x_out2.type_as(x)
+
+
 class SlowStep(nn.Module):
     """One-token step of the slow transformer with explicit KV-cache I/O."""
 
@@ -61,8 +78,8 @@ class SlowStep(nn.Module):
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local, self.head_dim)
-        q = apply_rotary_emb(q, freqs)
-        k = apply_rotary_emb(k, freqs)
+        q = rope_fixed(q, freqs)
+        k = rope_fixed(k, freqs)
         q = q.transpose(1, 2)  # [1, H, 1, D]
         k = k.transpose(1, 2)  # [1, n_local, 1, D]
         v = v.transpose(1, 2)
@@ -125,8 +142,8 @@ class Prefill(nn.Module):
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local, self.head_dim)
-        q = apply_rotary_emb(q, freqs)
-        k = apply_rotary_emb(k, freqs)
+        q = rope_fixed(q, freqs)
+        k = rope_fixed(k, freqs)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         ones = torch.ones(1, 1, self.n_head // self.n_local, 1, 1, dtype=x.dtype)
         k_full = (k.unsqueeze(2) * ones).reshape(
@@ -190,8 +207,8 @@ class FastStep(nn.Module):
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local, self.head_dim)
-        q = apply_rotary_emb(q, freqs)
-        k = apply_rotary_emb(k, freqs)
+        q = rope_fixed(q, freqs)
+        k = rope_fixed(k, freqs)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -380,9 +397,80 @@ def export(checkpoint: str, out_dir: str):
                        - model.fast_embeddings(ids).detach().numpy()).max()))
 
 
+def export_fp16(checkpoint: str, out_dir: str):
+    """Export fp16 slow16/fast16 graphs (DML fp16 ~2x fp32; RoPE uses
+    rope_fixed explicit dims because DML Reshape rejects -1 targets)."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    model, _ = load_model(checkpoint, device="cpu", precision=torch.float32)
+    assert isinstance(model, DualARTransformer), "expected DualARTransformer"
+    model = model.half()
+
+    torch.manual_seed(0)
+    n_cb = model.config.num_codebooks
+
+    slow = SlowStep(model).eval()
+    tok = torch.cat(
+        [
+            torch.randint(0, model.config.vocab_size, (1, 1, 1)),
+            torch.randint(0, model.config.codebook_size, (1, n_cb, 1)),
+        ],
+        dim=1,
+    )
+    pos = torch.tensor([5], dtype=torch.int32)
+    freqs = torch.randn(1, 32, 2)  # RoPE math runs in fp32 (matches the model)
+    mask = torch.randn(1, 1, 1, CACHE_LEN).half()
+    is_sem = torch.tensor([1], dtype=torch.int32)
+    k_ins = [torch.zeros(1, 2, CACHE_LEN, 64).half() for _ in model.layers]
+    v_ins = [torch.zeros(1, 2, CACHE_LEN, 64).half() for _ in model.layers]
+
+    torch.onnx.export(
+        slow,
+        (tok, pos, freqs, mask, is_sem, k_ins, v_ins),
+        str(out / "slow16.onnx"),
+        opset_version=18,
+        input_names=["tok", "pos", "freqs", "mask", "is_semantic"]
+        + [f"k_in_{i}" for i in range(len(model.layers))]
+        + [f"v_in_{i}" for i in range(len(model.layers))],
+        output_names=["logits", "hidden"]
+        + [f"k_step_{i}" for i in range(len(model.layers))]
+        + [f"v_step_{i}" for i in range(len(model.layers))],
+        do_constant_folding=False,
+    )
+    print(f"exported {out/'slow16.onnx'}")
+
+    fast = FastStep(model).eval()
+    h = torch.randn(1, 1, model.config.fast_dim).half()
+    posf = torch.tensor([3], dtype=torch.int32)
+    freqs_f = torch.randn(1, 32, 2)
+    mask_f = torch.randn(1, 1, 1, n_cb).half()
+    kf_ins = [torch.zeros(1, 2, n_cb, 64).half() for _ in model.fast_layers]
+    vf_ins = [torch.zeros(1, 2, n_cb, 64).half() for _ in model.fast_layers]
+
+    torch.onnx.export(
+        fast,
+        (h, posf, freqs_f, mask_f, kf_ins, vf_ins),
+        str(out / "fast16.onnx"),
+        opset_version=18,
+        input_names=["h", "pos", "freqs", "mask"]
+        + [f"k_in_{i}" for i in range(len(model.fast_layers))]
+        + [f"v_in_{i}" for i in range(len(model.fast_layers))],
+        output_names=["logits"]
+        + [f"k_step_{i}" for i in range(len(model.fast_layers))]
+        + [f"v_step_{i}" for i in range(len(model.fast_layers))],
+        do_constant_folding=False,
+    )
+    print(f"exported {out/'fast16.onnx'}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--out-dir", default="onnx_artifacts")
+    ap.add_argument("--fp16", action="store_true", help="export slow16/fast16 only")
     args = ap.parse_args()
-    export(args.checkpoint, args.out_dir)
+    if args.fp16:
+        export_fp16(args.checkpoint, args.out_dir)
+    else:
+        export(args.checkpoint, args.out_dir)
